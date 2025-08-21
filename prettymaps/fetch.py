@@ -574,6 +574,146 @@ def unified_osm_request(
 ) -> dict:
     """
     Unify all OSM requests into one to improve efficiency.
+    """
+    # Clean perimeter and keep in EPSG:4326
+    perimeter_with_tolerance = ox.project_gdf(perimeter).buffer(0).to_crs(4326)
+    perimeter_with_tolerance = unary_union(perimeter_with_tolerance.geometry).buffer(0)
+
+    bbox = box(*perimeter_with_tolerance.bounds)
+
+    gdfs = {}
+
+    combined_tags = merge_tags(
+        {
+            layer: kwargs
+            for layer, kwargs in layers_dict.items()
+            if layer not in gdfs
+            and layer not in ["streets", "railway", "waterway", "sea"]
+        }
+    )
+
+    try:
+        all_features = ox.features_from_polygon(bbox, tags=combined_tags)
+    except Exception:
+        all_features = GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    for layer, kwargs in layers_dict.items():
+        if layer in gdfs:
+            continue
+        try:
+            if layer in ["streets", "railway", "waterway"]:
+                graph = ox.graph_from_polygon(
+                    bbox,
+                    custom_filter=kwargs.get("custom_filter"),
+                    truncate_by_edge=True,
+                )
+                gdf = ox.graph_to_gdfs(graph, nodes=False)
+                if gdf.crs is None:
+                    gdf.set_crs(epsg=4326, inplace=True)
+
+            elif layer == "sea":
+                # Accept: layers_dict["sea"] = "/path/to/water_polygons.shp"
+                #   or   layers_dict["sea"] = "zip:///.../water-polygons.zip!water_polygons.shp"
+                #   or   dict with {"water_polygons_path": "..."} / {"water_gdf": ...}
+                try:
+                    if isinstance(kwargs, str):
+                        water_gdf = None
+                        water_path = kwargs  # plain string path from JSON
+                    else:
+                        water_gdf = kwargs.get("water_gdf")
+                        water_path = (
+                            kwargs.get("water_polygons_path")
+                            or kwargs.get("path")
+                            or kwargs.get("src")
+                            or kwargs.get("file")
+                            or kwargs.get("filepath")
+                        )
+
+                    if water_gdf is None:
+                        if not water_path:
+                            raise FileNotFoundError(
+                                "Provide 'sea' as a path string or a dict with 'water_polygons_path'."
+                            )
+                        minx, miny, maxx, maxy = bbox.bounds
+                        # Works for normal .shp and for zipped shapefiles using the zip://...!file.shp URL
+                        water_gdf = gp.read_file(
+                            water_path, bbox=(minx, miny, maxx, maxy)
+                        )
+
+                    # Ensure WGS84
+                    if water_gdf.crs is None:
+                        water_gdf = water_gdf.set_crs(epsg=4326)
+                    else:
+                        water_gdf = water_gdf.to_crs(epsg=4326)
+
+                    # Clip to bbox and dissolve
+                    aoi_gdf = gp.GeoDataFrame(geometry=[bbox], crs="EPSG:4326")
+                    sea_clip = gp.overlay(
+                        water_gdf[["geometry"]], aoi_gdf, how="intersection"
+                    )
+
+                    if len(sea_clip) == 0:
+                        gdf = gp.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                    else:
+                        sea_geom = unary_union(sea_clip.geometry).buffer(0)
+                        gdf = gp.GeoDataFrame(geometry=[sea_geom], crs="EPSG:4326")
+
+                except Exception as e:
+                    if logging:
+                        print(f"[sea] error: {e}")
+                    gdf = gp.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+            else:
+                if kwargs.get("osmid") is None:
+                    if layer == "perimeter":
+                        gdf = (
+                            perimeter.to_crs(epsg=4326)
+                            if perimeter.crs != "EPSG:4326"
+                            else perimeter
+                        )
+                    else:
+                        layer_tags = kwargs.get("tags")
+                        gdf = gp.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                        for key, value in (layer_tags or {}).items():
+                            if isinstance(value, bool) and value:
+                                filtered_features = all_features[
+                                    ~pd.isna(all_features[key])
+                                ]
+                            elif isinstance(value, list):
+                                filtered_features = all_features[
+                                    all_features[key].isin(value)
+                                ]
+                            else:
+                                filtered_features = all_features[
+                                    all_features[key] == value
+                                ]
+                            gdf = pd.concat([gdf, filtered_features], axis=0)
+                        if gdf.crs is None:
+                            gdf.set_crs(epsg=4326, inplace=True)
+                else:
+                    gdf = ox.geocode_to_gdf(kwargs.get("osmid"), by_osmid=True)
+                    if gdf.crs is None:
+                        gdf.set_crs(epsg=4326, inplace=True)
+                    else:
+                        gdf = gdf.to_crs(epsg=4326)
+
+            # Final clip to the cleaned perimeter
+            gdf = gdf.copy()
+            gdf.geometry = gdf.geometry.intersection(perimeter_with_tolerance)
+            gdf.drop(gdf[gdf.geometry.is_empty].index, inplace=True)
+
+            gdfs[layer] = gdf
+        except Exception:
+            gdfs[layer] = GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    return gdfs
+
+
+def unified_osm_request_old(
+    perimeter: GeoDataFrame, layers_dict: dict, logging: bool = False
+) -> dict:
+    """
+    Unify all OSM requests into one to improve efficiency.
 
     Parameters:
     perimeter (GeoDataFrame): The perimeter GeoDataFrame.
