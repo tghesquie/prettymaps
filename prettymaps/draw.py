@@ -55,7 +55,7 @@ from thefuzz import fuzz
 import shutil
 
 # Local imports
-from .fetch import get_gdfs, obtain_elevation, get_keypoints
+from .fetch import get_gdfs, obtain_elevation_with_meta, get_keypoints
 from .utils import log_execution_time
 
 # Log configuration for elapsed time
@@ -522,48 +522,60 @@ def draw_hillshade(
     **kwargs,
 ):
     if "hillshade" in layers:
-        elevation_data = obtain_elevation(gdfs["perimeter"])
-        elevation_data = np.clip(elevation_data, 0, None)
-        elevation_data = elevation_data.astype(np.float32)
-        # Upscale the elevation data to match A1 paper width (594mm)
-        scale_factor = 594 / elevation_data.shape[1]
-        elevation_data = cv2.resize(
-            elevation_data,
+        # Preserve current view
+        min_x, max_x = ax.get_xlim()
+        min_y, max_y = ax.get_ylim()
+
+        # Fetch DEM with spatial metadata
+        meta = obtain_elevation_with_meta(gdfs["perimeter"])
+        Z = np.clip(meta["data"], 0, None).astype(np.float32)
+        xmin, ymin, xmax, ymax = meta["bounds"]
+        dx0, dy0 = map(abs, meta["res"])  # base pixel spacing in meters
+
+        # Upscale to match A1 width (594mm) like original code
+        scale_factor = 594 / Z.shape[1]
+        Z = cv2.resize(
+            Z,
             (
-                int(elevation_data.shape[1] * scale_factor),
-                int(elevation_data.shape[0] * scale_factor),
+                int(Z.shape[1] * scale_factor),
+                int(Z.shape[0] * scale_factor),
             ),
         )
-        # Perform bilateral filtering to remove noise
-        # Apply bilateral filter
-        d = 5  # Diameter of each pixel neighborhood
-        sigma_color = 5  # Filter sigma in the color space
-        sigma_space = 5  # Filter sigma in the coordinate space
-        elevation_data = cv2.bilateralFilter(
-            elevation_data, d, sigma_color, sigma_space
-        )
-        ls = LightSource(azdeg=azdeg, altdeg=altdeg)
-        hillshade = ls.hillshade(elevation_data, vert_exag=vert_exag, dx=dx, dy=dy)
-        # Convert hillshade to RGBA
 
-        # hillshade = np.clip(hillshade, 0, np.inf)
-        # hillshade = MinMaxScaler((0, 1)).fit_transform(hillshade)
+        # Bilateral filtering to reduce noise
+        d = 5
+        sigma_color = 5
+        sigma_space = 5
+        Z = cv2.bilateralFilter(Z, d, sigma_color, sigma_space)
+
+        # Adjust dx, dy for the resampling factor
+        dx_eff = dx0 / scale_factor
+        dy_eff = dy0 / scale_factor
+
+        # Ensure y increases upward for plotting; flip data if raster y descends
+        if meta.get("y_descending", False):
+            Z_plot = Z[::-1, :]
+        else:
+            Z_plot = Z
+
+        # Compute hillshade using physical spacing
+        ls = LightSource(azdeg=azdeg, altdeg=altdeg)
+        hillshade = ls.hillshade(Z_plot, vert_exag=vert_exag, dx=dx_eff, dy=dy_eff)
+
+        # Convert hillshade to RGBA with alpha mapped from shade
         hillshade_rgba = np.zeros((*hillshade.shape, 4), dtype=np.uint8)
         hillshade_rgba[..., :3] = (hillshade[..., None] * 255).astype(np.uint8)
         hillshade_rgba[..., 3] = ((1 - hillshade) * 255).astype(np.uint8)
 
-        min_x, max_x = ax.get_xlim()
-        min_y, max_y = ax.get_ylim()
-        min_lon, min_lat, max_lon, max_lat = ox.project_gdf(
-            gdfs["perimeter"]
-        ).total_bounds
+        # Draw aligned with raster bounds; origin lower since Z_plot is bottom-to-top
         ax.imshow(
             hillshade_rgba,
-            # cmap="gray",
             alpha=alpha,
-            extent=(min_lon, max_lon, min_lat, max_lat),
+            extent=(xmin, xmax, ymin, ymax),
+            origin="lower",
             zorder=20,
         )
+        # Restore original view
         ax.set_xlim(min_x, max_x)
         ax.set_ylim(min_y, max_y)
 
@@ -575,6 +587,244 @@ def draw_hillshade(
             except Exception as e:
                 if logging:
                     print(f"Warning: Failed to delete {srtm1_dir}: {e}")
+
+
+def draw_elevation_isolines(
+    layers,
+    gdfs,
+    ax,
+    layer_key="isolines",
+    interval=50,  # contour step in meters
+    index_every=5,  # every Nth contour is an index (thicker)
+    smooth="gaussian",  # "gaussian" | "bilateral" | None | True/False (compat)
+    gaussian_sigma=1.0,  # stddev (pixels) if gaussian
+    bilateral_d=5,  # diameter if bilateral
+    bilateral_sigma_color=5,
+    bilateral_sigma_space=5,
+    upscale_to_a1=True,  # mimic hillshade upscaling to A1 width (594mm)
+    label=False,  # label contour elevations
+    mask_outside=True,  # clip contours to the perimeter polygon(s)
+    line_width=0.6,
+    index_line_width=1.2,
+    line_style="solid",
+    line_color="k",
+    index_line_color="k",
+    line_alpha=1.0,  # NEW: opacity for normal isolines
+    index_line_alpha=1.0,  # NEW: opacity for index isolines
+    zorder=9,
+    logging=False,
+    **kwargs,
+):
+    """
+    Draw elevation isolines instead of hillshade.
+
+    Requires obtain_elevation_with_meta(geom) -> {"data": 2D array, "bounds": (xmin,ymin,xmax,ymax), "y_descending": bool}
+    Expects gdfs["perimeter"] in geographic CRS; we project to a metric CRS with ox.project_gdf for masking only.
+    """
+    from matplotlib.path import Path as MplPath
+    import shutil, os, math
+    import numpy as np
+    import osmnx as ox
+
+    # --- 1) Fetch & sanitize elevation raster (with metadata)
+    meta = obtain_elevation_with_meta(gdfs["perimeter"])
+    elevation_data = np.clip(meta["data"], 0, None).astype(np.float32)
+
+    # --- 2) Optional upscale (to mirror hillshade print workflow)
+    if upscale_to_a1:
+        try:
+            import cv2
+
+            scale_factor = (
+                594 / elevation_data.shape[1]
+            )  # A1 width in mm, like your code
+            elevation_data = cv2.resize(
+                elevation_data,
+                (
+                    int(elevation_data.shape[1] * scale_factor),
+                    int(elevation_data.shape[0] * scale_factor),
+                ),
+                interpolation=cv2.INTER_CUBIC,
+            )
+        except Exception as e:
+            if logging:
+                print(f"Upscale skipped (OpenCV not available or failed): {e}")
+
+    # --- 3) Optional smoothing
+    # Backward compatibility: True -> "bilateral", False -> None
+    if isinstance(smooth, bool):
+        smooth = "bilateral" if smooth else None
+
+    if smooth in ("gaussian", "bilateral"):
+        if smooth == "bilateral":
+            try:
+                import cv2
+
+                elevation_data = cv2.bilateralFilter(
+                    elevation_data,
+                    d=bilateral_d,
+                    sigmaColor=bilateral_sigma_color,
+                    sigmaSpace=bilateral_sigma_space,
+                )
+            except Exception as e:
+                if logging:
+                    print(f"Bilateral smoothing skipped: {e}")
+        elif smooth == "gaussian":
+            # Prefer SciPy if available; else OpenCV; else simple kernel fallback
+            done = False
+            try:
+                from scipy.ndimage import gaussian_filter
+
+                elevation_data = gaussian_filter(elevation_data, sigma=gaussian_sigma)
+                done = True
+            except Exception:
+                pass
+            if not done:
+                try:
+                    import cv2
+
+                    # cv2 uses kernel size; approximate from sigma (rule of thumb k≈6σ+1, ensure odd)
+                    k = int(max(3, 2 * int(3 * gaussian_sigma) + 1))
+                    elevation_data = cv2.GaussianBlur(
+                        elevation_data, (k, k), gaussian_sigma
+                    )
+                    done = True
+                except Exception:
+                    pass
+            if not done:
+                # Minimal fallback: 3x3 box blur repeated to approximate gaussian
+                kernel = np.array([[1, 2, 1], [2, 4, 2], [1, 2, 1]], dtype=np.float32)
+                kernel /= kernel.sum()
+                try:
+                    from scipy.signal import convolve2d
+
+                    elevation_data = convolve2d(
+                        elevation_data, kernel, mode="same", boundary="symm"
+                    )
+                except Exception:
+                    # Pure-numpy slow fallback
+                    pad = 1
+                    padded = np.pad(elevation_data, pad, mode="edge")
+                    out = np.empty_like(elevation_data)
+                    for i in range(out.shape[0]):
+                        for j in range(out.shape[1]):
+                            window = padded[i : i + 3, j : j + 3]
+                            out[i, j] = float((window * kernel).sum())
+                    elevation_data = out
+                if logging:
+                    print("Gaussian smoothing used a lightweight fallback.")
+
+    # --- 4) Compute plotting extent from raster metadata
+    min_x, max_x = ax.get_xlim()
+    min_y, max_y = ax.get_ylim()
+    xmin, ymin, xmax, ymax = meta["bounds"]
+
+    # Ensure y increases upward for plotting; flip if needed
+    if meta.get("y_descending", False):
+        elevation_data = elevation_data[::-1, :]
+
+    nrows, ncols = elevation_data.shape
+    xs = np.linspace(xmin, xmax, ncols, dtype=np.float64)
+    ys = np.linspace(ymin, ymax, nrows, dtype=np.float64)
+    XX, YY = np.meshgrid(xs, ys)
+
+    # --- 5) Optional mask outside perimeter (avoid contours outside AoI)
+    perim_proj = ox.project_gdf(gdfs["perimeter"])  # for masking only
+    if mask_outside and not perim_proj.empty:
+        paths = []
+        for geom in perim_proj.geometry:
+            if geom is None:
+                continue
+            if geom.geom_type == "Polygon":
+                paths.append(MplPath(np.asarray(geom.exterior.coords)))
+                for ring in geom.interiors:
+                    paths.append(MplPath(np.asarray(ring.coords)))
+            elif geom.geom_type == "MultiPolygon":
+                for poly in geom.geoms:
+                    paths.append(MplPath(np.asarray(poly.exterior.coords)))
+                    for ring in poly.interiors:
+                        paths.append(MplPath(np.asarray(ring.coords)))
+
+        pts = np.column_stack([XX.ravel(), YY.ravel()])
+        inside_any = np.zeros(pts.shape[0], dtype=bool)
+        for p in paths:
+            inside_any ^= p.contains_points(pts)  # XOR toggle exteriors/holes
+        mask = ~inside_any.reshape(elevation_data.shape)
+        elevation_data = elevation_data.copy()
+        elevation_data[mask] = np.nan
+
+    # --- 6) Choose contour levels
+    if np.all(np.isnan(elevation_data)):
+        if logging:
+            print("All elevation values are NaN after masking; skipping contours.")
+        ax.set_xlim(min_x, max_x)
+        ax.set_ylim(min_y, max_y)
+        return None
+
+    zmin = float(np.nanmin(elevation_data))
+    zmax = float(np.nanmax(elevation_data))
+    if zmax <= zmin or interval <= 0:
+        if logging:
+            print("Invalid contour configuration; skipping.")
+        ax.set_xlim(min_x, max_x)
+        ax.set_ylim(min_y, max_y)
+        return None
+
+    start = math.floor(zmin / interval) * interval
+    stop = math.ceil(zmax / interval) * interval
+    levels = np.arange(start, stop + interval, interval, dtype=float)
+
+    # --- 7) Draw contours (with alpha)
+    cs = ax.contour(
+        XX,
+        YY,
+        elevation_data,
+        levels=levels,
+        linewidths=line_width,
+        linestyles=line_style,
+        colors=line_color,
+        alpha=line_alpha,  # opacity
+        zorder=zorder,
+    )
+
+    # Index contours
+    if index_every and index_every > 1:
+        index_levels = levels[::index_every]
+        if len(index_levels) > 0:
+            ax.contour(
+                XX,
+                YY,
+                elevation_data,
+                levels=index_levels,
+                linewidths=index_line_width,
+                linestyles=line_style,
+                colors=index_line_color,
+                alpha=index_line_alpha,  # opacity for index lines
+                zorder=zorder + 0.1,
+            )
+
+    # --- 8) Labels
+    if label:
+        try:
+            ax.clabel(cs, inline=True, fmt=lambda v: f"{int(round(v))} m", fontsize=8)
+        except Exception as e:
+            if logging:
+                print(f"Contour labeling failed: {e}")
+
+    # --- 9) Restore original view
+    ax.set_xlim(min_x, max_x)
+    ax.set_ylim(min_y, max_y)
+
+    # --- 10) Cleanup local SRTM cache (mirrors your hillshade)
+    srtm1_dir = os.path.join(os.getcwd(), "SRTM1")
+    if os.path.isdir(srtm1_dir):
+        try:
+            shutil.rmtree(srtm1_dir)
+        except Exception as e:
+            if logging:
+                print(f"Warning: Failed to delete {srtm1_dir}: {e}")
+
+    return cs
 
 
 @log_execution_time

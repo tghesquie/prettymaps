@@ -119,8 +119,12 @@ def obtain_elevation(gdf):
             ["eio", "clean"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
-    # Get the bounding box of the polygon
-    bounds = gdf.total_bounds
+    # Get the bounding box of the polygon in EPSG:4326 (lon/lat)
+    try:
+        gdf_ll = gdf.to_crs(4326) if gdf.crs is not None else gdf
+    except Exception:
+        gdf_ll = gdf
+    bounds = gdf_ll.total_bounds
     min_lon, min_lat, max_lon, max_lat = bounds
 
     # Configure the bounding box for the elevation library
@@ -150,12 +154,78 @@ def obtain_elevation(gdf):
 
     raster = rxr.open_rasterio(output_file).squeeze()
 
-    raster = raster.rio.reproject(CRS.from_string(ox.project_gdf(gdf).crs.to_string()))
+    # Reproject DEM to a suitable projected CRS (meters) matching projected perimeter
+    projected_crs = ox.project_gdf(gdf).crs
+    raster = raster.rio.reproject(CRS.from_string(projected_crs.to_string()))
 
     # convert to numpy array
     elevation_data = raster.data
 
     return elevation_data
+
+
+def obtain_elevation_with_meta(gdf):
+    """
+    Obtain elevation raster clipped to the given geometry, reprojected to a metric CRS,
+    and return data along with spatial metadata (bounds, resolution, coordinates).
+
+    Returns a dict with keys:
+      - data: 2D numpy array (float32)
+      - bounds: (xmin, ymin, xmax, ymax)
+      - res: (dx, dy) in projected units (meters); dy may be negative depending on y axis order
+      - x: 1D array of x coordinates (column centers)
+      - y: 1D array of y coordinates (row centers)
+      - crs: raster CRS
+      - y_descending: True if y decreases from first row to last row
+    """
+
+    # Ensure lon/lat bounds for clipping
+    try:
+        gdf_ll = gdf.to_crs(4326) if gdf.crs is not None else gdf
+    except Exception:
+        gdf_ll = gdf
+    min_lon, min_lat, max_lon, max_lat = gdf_ll.total_bounds
+
+    # Clip SRTM within bbox (with a small margin to avoid edge artifacts)
+    output_file = os.path.join(os.getcwd(), "elevation.tif")
+    elevation.clip(
+        bounds=(min_lon, min_lat, max_lon, max_lat),
+        output=output_file,
+        margin="10%",
+        cache_dir=".",
+    )
+
+    # Open and reproject to projected CRS matching perimeter processing
+    raster = rxr.open_rasterio(output_file).squeeze()
+    projected_crs = ox.project_gdf(gdf).crs
+    raster = raster.rio.reproject(CRS.from_string(projected_crs.to_string()))
+
+    data = raster.values.astype(np.float32)
+    xmin, ymin, xmax, ymax = raster.rio.bounds()
+    try:
+        dx, dy = raster.rio.resolution()
+    except Exception:
+        # Fallback: approximate from bounds/shape
+        ny, nx = data.shape
+        dx = (xmax - xmin) / max(nx, 1)
+        dy = (ymax - ymin) / max(ny, 1)
+    x = raster.x.values if hasattr(raster, "x") else np.linspace(xmin, xmax, data.shape[1])
+    y = raster.y.values if hasattr(raster, "y") else np.linspace(ymin, ymax, data.shape[0])
+    y_desc = False
+    try:
+        y_desc = bool(y[0] > y[-1])
+    except Exception:
+        pass
+
+    return {
+        "data": data,
+        "bounds": (float(xmin), float(ymin), float(xmax), float(ymax)),
+        "res": (float(dx), float(dy)),
+        "x": x,
+        "y": y,
+        "crs": raster.rio.crs,
+        "y_descending": y_desc,
+    }
 
 
 def get_sea_mask(gdf):
