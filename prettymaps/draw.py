@@ -50,7 +50,6 @@ from shapely.geometry import (
     box,
 )
 from shapely.geometry.base import BaseGeometry
-from sklearn.preprocessing import MinMaxScaler
 from thefuzz import fuzz
 import shutil
 
@@ -181,21 +180,45 @@ def graph_to_shapely(gdf: gp.GeoDataFrame, width: float = 1.0) -> BaseGeometry:
         BaseGeometry: Shapely
     """
 
-    def highway_to_width(highway):
-        if (type(highway) == str) and (highway in width):
-            return width[highway]
-        elif isinstance(highway, Iterable):
-            for h in highway:
-                if h in width:
-                    return width[h]
-            return np.nan
-        else:
+    if isinstance(width, dict):
+        mapping = width  # capture once
+
+        def value_to_width(val: Any) -> float:
+            # Single tag
+            if isinstance(val, str):
+                return mapping.get(val, np.nan)
+
+            # Multiple tags stored as iterable (e.g. list), but avoid treating str/bytes as iterables
+            if isinstance(val, Iterable) and not isinstance(val, (str, bytes)):
+                for v in val:
+                    if v in mapping:
+                        return mapping[v]
             return np.nan
 
-    # Annotate GeoDataFrame with the width for each highway type
-    gdf["width"] = (
-        gdf["highway"].map(highway_to_width) if type(width) == dict else width
-    )
+        # Choose which attribute column to use for the mapping
+        attr_col = None
+        for candidate in ["waterway", "highway", "railway"]:
+            if candidate in gdf.columns and gdf[candidate].notna().any():
+                attr_col = candidate
+                break
+
+        if attr_col is not None:
+            gdf["width"] = gdf[attr_col].map(value_to_width)
+
+            # If everything is NaN (no matching tags), fallback to a constant width
+            if gdf["width"].isna().all():
+                gdf["width"] = max(mapping.values())
+        else:
+            # No suitable attribute column at all: still draw, with a single width
+            gdf["width"] = max(mapping.values())
+
+    else:
+        # Constant width for all edges OR no width at all (your "as before" behaviour)
+        if width is None:
+            # No width → everything will be dropped below
+            gdf["width"] = np.nan
+        else:
+            gdf["width"] = width
 
     # Remove rows with inexistent width
     gdf.drop(gdf[gdf.width.isna()].index, inplace=True)
@@ -593,7 +616,6 @@ def draw_elevation_isolines(
     layers,
     gdfs,
     ax,
-    layer_key="isolines",
     interval=50,  # contour step in meters
     index_every=5,  # every Nth contour is an index (thicker)
     smooth="gaussian",  # "gaussian" | "bilateral" | None | True/False (compat)
@@ -622,7 +644,9 @@ def draw_elevation_isolines(
     Expects gdfs["perimeter"] in geographic CRS; we project to a metric CRS with ox.project_gdf for masking only.
     """
     from matplotlib.path import Path as MplPath
-    import shutil, os, math
+    import shutil
+    import os
+    import math
     import numpy as np
     import osmnx as ox
 

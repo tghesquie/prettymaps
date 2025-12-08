@@ -26,17 +26,13 @@ from shapely.geometry import (
     Point,
     Polygon,
     MultiPolygon,
-    LineString,
-    MultiLineString,
 )
 import os
-from copy import deepcopy
 from geopandas import GeoDataFrame
 from shapely.affinity import rotate, scale
 from shapely.ops import unary_union
-from shapely.errors import ShapelyDeprecationWarning
+from osmnx._errors import InsufficientResponseError
 
-from IPython.display import display
 from skimage.measure import find_contours
 import elevation
 import geopandas as gp
@@ -45,12 +41,9 @@ from rasterio.crs import CRS
 from .utils import log_execution_time
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import time
 import subprocess
-import sys
-import contextlib
-from tqdm import tqdm
-from concurrent.futures import as_completed
 import pandas as pd
 
 logging.basicConfig(
@@ -179,53 +172,140 @@ def obtain_elevation_with_meta(gdf):
       - y_descending: True if y decreases from first row to last row
     """
 
-    # Ensure lon/lat bounds for clipping
+    # Ensure lon/lat bounds for clipping (WGS84)
     try:
         gdf_ll = gdf.to_crs(4326) if gdf.crs is not None else gdf
     except Exception:
         gdf_ll = gdf
     min_lon, min_lat, max_lon, max_lat = gdf_ll.total_bounds
 
-    # Clip SRTM within bbox (with a small margin to avoid edge artifacts)
-    output_file = os.path.join(os.getcwd(), "elevation.tif")
-    elevation.clip(
-        bounds=(min_lon, min_lat, max_lon, max_lat),
-        output=output_file,
-        margin="10%",
-        cache_dir=".",
-    )
-
-    # Open and reproject to projected CRS matching perimeter processing
-    raster = rxr.open_rasterio(output_file).squeeze()
+    # Target projected CRS used elsewhere (meters)
     projected_crs = ox.project_gdf(gdf).crs
-    raster = raster.rio.reproject(CRS.from_string(projected_crs.to_string()))
+    proj_str = projected_crs.to_string() if projected_crs is not None else ""
 
-    data = raster.values.astype(np.float32)
-    xmin, ymin, xmax, ymax = raster.rio.bounds()
-    try:
-        dx, dy = raster.rio.resolution()
-    except Exception:
-        # Fallback: approximate from bounds/shape
-        ny, nx = data.shape
-        dx = (xmax - xmin) / max(nx, 1)
-        dy = (ymax - ymin) / max(ny, 1)
-    x = raster.x.values if hasattr(raster, "x") else np.linspace(xmin, xmax, data.shape[1])
-    y = raster.y.values if hasattr(raster, "y") else np.linspace(ymin, ymax, data.shape[0])
-    y_desc = False
-    try:
-        y_desc = bool(y[0] > y[-1])
-    except Exception:
-        pass
+    # Build deterministic cache key from spatial bounds + target CRS + margin
+    key_src = (
+        f"{min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}|{proj_str}|margin=10%"
+    )
+    key = hashlib.md5(key_src.encode("utf-8")).hexdigest()
+    cache_dir = os.path.join(os.getcwd(), ".elev_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, f"{key}.npz")
+    lock_path = os.path.join(cache_dir, f"{key}.lock")
+    tmp_path = os.path.join(cache_dir, f"{key}.tmp.npz")
 
-    return {
-        "data": data,
-        "bounds": (float(xmin), float(ymin), float(xmax), float(ymax)),
-        "res": (float(dx), float(dy)),
-        "x": x,
-        "y": y,
-        "crs": raster.rio.crs,
-        "y_descending": y_desc,
-    }
+    # Fast path: load cached npz if present
+    if os.path.exists(cache_path):
+        with np.load(cache_path, allow_pickle=False) as npz:
+            data = npz["data"].astype(np.float32)
+            xmin, ymin, xmax, ymax = npz["bounds"].tolist()
+            dx, dy = npz["res"].tolist()
+            y_desc = bool(npz["y_desc"])  # stored as 0/1
+            return {
+                "data": data,
+                "bounds": (float(xmin), float(ymin), float(xmax), float(ymax)),
+                "res": (float(dx), float(dy)),
+                # x/y are not strictly needed downstream; recompute from bounds if absent
+                "x": np.linspace(float(xmin), float(xmax), data.shape[1]),
+                "y": np.linspace(float(ymin), float(ymax), data.shape[0]),
+                "crs": projected_crs,
+                "y_descending": y_desc,
+            }
+
+    # Acquire a simple interprocess lock (create-if-not-exists)
+    acquired = False
+    while not acquired:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.close(fd)
+            acquired = True
+        except FileExistsError:
+            # Another process is generating; wait and re-check cache
+            time.sleep(0.2)
+            if os.path.exists(cache_path):
+                with np.load(cache_path, allow_pickle=False) as npz:
+                    data = npz["data"].astype(np.float32)
+                    xmin, ymin, xmax, ymax = npz["bounds"].tolist()
+                    dx, dy = npz["res"].tolist()
+                    y_desc = bool(npz["y_desc"])  # stored as 0/1
+                    return {
+                        "data": data,
+                        "bounds": (float(xmin), float(ymin), float(xmax), float(ymax)),
+                        "res": (float(dx), float(dy)),
+                        "x": np.linspace(float(xmin), float(xmax), data.shape[1]),
+                        "y": np.linspace(float(ymin), float(ymax), data.shape[0]),
+                        "crs": projected_crs,
+                        "y_descending": y_desc,
+                    }
+
+    # Locked: perform clip/reproject, then persist sidecar cache
+    try:
+        output_file = os.path.join(os.getcwd(), "elevation.tif")
+        elevation.clip(
+            bounds=(min_lon, min_lat, max_lon, max_lat),
+            output=output_file,
+            margin="10%",
+            cache_dir=".",
+        )
+
+        raster = rxr.open_rasterio(output_file).squeeze()
+        raster = raster.rio.reproject(CRS.from_string(proj_str))
+
+        data = raster.values.astype(np.float32)
+        xmin, ymin, xmax, ymax = raster.rio.bounds()
+        try:
+            dx, dy = raster.rio.resolution()
+        except Exception:
+            ny, nx = data.shape
+            dx = (xmax - xmin) / max(nx, 1)
+            dy = (ymax - ymin) / max(ny, 1)
+
+        # Determine if raster y decreases (top->bottom)
+        y_vals = (
+            raster.y.values
+            if hasattr(raster, "y")
+            else np.linspace(ymin, ymax, data.shape[0])
+        )
+        y_desc = False
+        try:
+            y_desc = bool(y_vals[0] > y_vals[-1])
+        except Exception:
+            pass
+
+        # Persist compressed cache atomically
+        np.savez_compressed(
+            tmp_path,
+            data=data,
+            bounds=np.array([xmin, ymin, xmax, ymax], dtype=np.float64),
+            res=np.array([dx, dy], dtype=np.float64),
+            y_desc=np.array(1 if y_desc else 0, dtype=np.uint8),
+        )
+        os.replace(tmp_path, cache_path)
+
+        return {
+            "data": data,
+            "bounds": (float(xmin), float(ymin), float(xmax), float(ymax)),
+            "res": (float(dx), float(dy)),
+            "x": (
+                raster.x.values
+                if hasattr(raster, "x")
+                else np.linspace(xmin, xmax, data.shape[1])
+            ),
+            "y": (
+                raster.y.values
+                if hasattr(raster, "y")
+                else np.linspace(ymin, ymax, data.shape[0])
+            ),
+            "crs": raster.rio.crs,
+            "y_descending": y_desc,
+        }
+    finally:
+        # Always release the lock
+        try:
+            if os.path.exists(lock_path):
+                os.unlink(lock_path)
+        except Exception:
+            pass
 
 
 def get_sea_mask(gdf):
@@ -653,13 +733,17 @@ def unified_osm_request(
 
     gdfs = {}
 
+    # combined_tags = merge_tags(
+    #    {
+    #        layer: kwargs
+    #        for layer, kwargs in layers_dict.items()
+    #        if layer not in gdfs
+    #        and layer not in ["streets", "railway", "waterway", "sea"]
+    #    }
+    # )
+
     combined_tags = merge_tags(
-        {
-            layer: kwargs
-            for layer, kwargs in layers_dict.items()
-            if layer not in gdfs
-            and layer not in ["streets", "railway", "waterway", "sea"]
-        }
+        {layer: kwargs for layer, kwargs in layers_dict.items() if layer not in gdfs}
     )
 
     try:
@@ -672,10 +756,50 @@ def unified_osm_request(
             continue
         try:
             if layer in ["streets", "railway", "waterway"]:
-                graph = ox.graph_from_polygon(
-                    bbox,
-                    custom_filter=kwargs.get("custom_filter"),
-                    truncate_by_edge=True,
+                # Build custom_filter from kwargs["custom_filter"] + kwargs["tags"]
+                custom_filter = kwargs.get("custom_filter") or ""
+                tags = kwargs.get("tags") or {}
+
+                # Turn tags dict into Overpass-style filters and append
+                # e.g. {"waterway": ["stream","river"]} -> ["waterway"~"stream|river"]
+                for key, value in tags.items():
+                    if isinstance(value, bool) and value:
+                        # presence of a key
+                        custom_filter += f'["{key}"]'
+                    elif isinstance(value, list):
+                        joined = "|".join(value)
+                        custom_filter += f'["{key}"~"{joined}"]'
+                    else:
+                        custom_filter += f'["{key}"="{value}"]'
+
+                # Allow network_type override per layer, default to "all"
+                network_type = kwargs.get("network_type", "all")
+
+                # graph = ox.graph_from_polygon(
+                #    bbox,
+                #    custom_filter=custom_filter if custom_filter else None,
+                #    network_type=network_type,
+                #    truncate_by_edge=True,
+                # )
+
+                try:
+                    graph = ox.graph_from_polygon(
+                        bbox,
+                        custom_filter=custom_filter or None,
+                        network_type=network_type,
+                        truncate_by_edge=True,
+                    )
+                except InsufficientResponseError as exc:
+                    if logging:
+                        print(
+                            f"[{layer}] InsufficientResponseError: {exc}. "
+                            "Returning empty GeoDataFrame for this layer."
+                        )
+                    gdfs[layer] = gp.GeoDataFrame(geometry=[], crs="EPSG:4326")
+                    continue
+
+                print(
+                    f"[{layer}] fetched {len(graph.nodes)} nodes and {len(graph.edges)} edges"
                 )
                 gdf = ox.graph_to_gdfs(graph, nodes=False)
                 if gdf.crs is None:
@@ -816,7 +940,7 @@ def unified_osm_request_old(
     # Fetch all features in one request
     try:
         all_features = ox.features_from_polygon(bbox, tags=combined_tags)
-    except Exception as e:
+    except Exception:
         all_features = GeoDataFrame(geometry=[])
 
     # Split the features into separate GeoDataFrames based on the layers_dict
@@ -899,7 +1023,7 @@ def unified_osm_request_old(
             gdf.drop(gdf[gdf.geometry.is_empty].index, inplace=True)
             gdfs[layer] = gdf
             # write_to_cache(perimeter, gdf, layers_dict[layer])
-        except Exception as e:
+        except Exception:
             # print(f"Error fetching {layer}: {e}")
             gdfs[layer] = GeoDataFrame(geometry=[])
 
