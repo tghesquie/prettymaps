@@ -51,6 +51,7 @@ from shapely.geometry import (
 )
 from shapely.geometry.base import BaseGeometry
 from thefuzz import fuzz
+from scipy.ndimage import median_filter
 import shutil
 
 # Local imports
@@ -612,6 +613,15 @@ def draw_hillshade(
                     print(f"Warning: Failed to delete {srtm1_dir}: {e}")
 
 
+def replace_outliers(data: np.ndarray) -> np.ndarray:
+    smooth_data = median_filter(data, size=5)
+    diff = np.abs(data - smooth_data)
+    threshold = np.std(diff) * 5
+    filtered_data = np.where(diff > threshold, smooth_data, data)
+
+    return filtered_data
+
+
 def draw_elevation_isolines(
     layers,
     gdfs,
@@ -653,6 +663,7 @@ def draw_elevation_isolines(
     # --- 1) Fetch & sanitize elevation raster (with metadata)
     meta = obtain_elevation_with_meta(gdfs["perimeter"])
     elevation_data = np.clip(meta["data"], 0, None).astype(np.float32)
+    elevation_data = replace_outliers(elevation_data)
 
     # --- 2) Optional upscale (to mirror hillshade print workflow)
     if upscale_to_a1:
