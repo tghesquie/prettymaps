@@ -798,9 +798,6 @@ def unified_osm_request(
                     gdfs[layer] = gp.GeoDataFrame(geometry=[], crs="EPSG:4326")
                     continue
 
-                print(
-                    f"[{layer}] fetched {len(graph.nodes)} nodes and {len(graph.edges)} edges"
-                )
                 gdf = ox.graph_to_gdfs(graph, nodes=False)
                 if gdf.crs is None:
                     gdf.set_crs(epsg=4326, inplace=True)
